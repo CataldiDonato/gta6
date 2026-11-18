@@ -315,19 +315,23 @@ class Clipboard:
 
 
 def paste_and_enter():
-    """Ctrl+V y Enter en la ventana enfocada, sin dependencias extra."""
+    """Ctrl+A, Ctrl+V y Enter en la ventana enfocada, sin dependencias extra."""
     if sys.platform == "win32":
         import ctypes
         kbd = ctypes.windll.user32.keybd_event
-        VK_CONTROL, VK_V, VK_RETURN, UP = 0x11, 0x56, 0x0D, 0x0002
-        kbd(VK_CONTROL, 0, 0, 0); kbd(VK_V, 0, 0, 0); kbd(VK_V, 0, UP, 0); kbd(VK_CONTROL, 0, UP, 0)
+        VK_CONTROL, VK_A, VK_V, VK_RETURN, UP = 0x11, 0x41, 0x56, 0x0D, 0x0002
+        kbd(VK_CONTROL, 0, 0, 0)
+        kbd(VK_A, 0, 0, 0); kbd(VK_A, 0, UP, 0)   # seleccionar todo: el pegado reemplaza lo que haya
+        kbd(VK_V, 0, 0, 0); kbd(VK_V, 0, UP, 0)
+        kbd(VK_CONTROL, 0, UP, 0)
         time.sleep(0.05)
         kbd(VK_RETURN, 0, 0, 0); kbd(VK_RETURN, 0, UP, 0)
     elif sys.platform == "darwin":
-        subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down',
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke "a" using command down',
+                        "-e", 'tell application "System Events" to keystroke "v" using command down',
                         "-e", "delay 0.05", "-e", 'tell application "System Events" to key code 36'])
     else:
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v", "Return"])
+        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+a", "ctrl+v", "Return"])
 
 
 def alert(code: str, kind: str):
