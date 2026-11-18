@@ -1,0 +1,5 @@
+mss
+pytesseract
+pillow
+streamlink
+av
