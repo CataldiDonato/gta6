@@ -31,7 +31,19 @@ python3 -m venv .venv
 
 La primera vez que arranca baja los modelos del OCR (~30 MB). Arrancalo una vez antes del sorteo.
 
-## Uso
+## Modo chat (recomendado si los mods tiran los códigos por chat)
+
+```
+.venv\Scripts\python code_watcher.py --twitch rubius --chat --auto-enter
+```
+
+- Solo toma códigos que escriban **mods o el streamer**. Lo verifica con la marca que pone el
+  servidor de Twitch en cada mensaje: alguien que se ponga "Moderador" de nombre no pasa.
+- No baja el video: casi no usa CPU y llega sin el retraso del video.
+- No necesita `--pick` ni zona.
+- Con `--debug` muestra los códigos que tiró gente que no es mod (y que se ignoraron).
+
+## Uso (modo video)
 
 En Windows usá `.venv\Scripts\python`, en Linux `.venv/bin/python`.
 
@@ -50,7 +62,8 @@ En Windows usá `.venv\Scripts\python`, en Linux `.venv/bin/python`.
 
 | Opción | Para qué |
 |---|---|
-| `--auto-enter` | Ctrl+V + Enter al detectar un código |
+| `--chat` | solo chat: códigos de mods/streamer, sin mirar el video |
+| `--auto-enter` | Ctrl+A + Ctrl+V + Enter al detectar un código |
 | `--pick` | volver a elegir la zona |
 | `--debug` | ver lo que lee y cuánto tarda cada lectura |
 | `--instant` | no esperar la 2da lectura aunque no diga "CODIGO" |

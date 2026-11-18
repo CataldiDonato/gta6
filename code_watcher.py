@@ -18,8 +18,10 @@ Opciones:
 """
 import argparse
 import json
+import queue
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -227,6 +229,66 @@ class TwitchSource:
         return img[int(c["y0"] * h):int(c["y1"] * h), int(c["x0"] * w):int(c["x1"] * w)]
 
 
+# =============================================================== chat de Twitch
+def parse_privmsg(line: str) -> tuple[dict, str, str] | None:
+    """'@tags :user!user@... PRIVMSG #canal :mensaje' -> (tags, usuario, mensaje)."""
+    if " PRIVMSG " not in line or not line.startswith("@"):
+        return None
+    tags_str, rest = line[1:].split(" ", 1)
+    tags = dict(t.split("=", 1) for t in tags_str.split(";") if "=" in t)
+    user = rest[1:].split("!", 1)[0]
+    msg = rest.split(" PRIVMSG ", 1)[1].split(" :", 1)[1] if " :" in rest.split(" PRIVMSG ", 1)[1] else ""
+    return tags, user, msg
+
+
+def is_mod(tags: dict) -> bool:
+    """Lo decide el servidor de Twitch (tags), no el nombre: no se puede falsificar."""
+    badges = tags.get("badges", "")
+    return tags.get("mod") == "1" or "moderator/" in badges or "broadcaster/" in badges
+
+
+def chat_codes(msg: str) -> list[str]:
+    t = msg.upper().replace("—", "-").replace("–", "-")
+    return ["-".join(m) for m in CODE.findall(t)]
+
+
+def chat_reader(channel: str, out: "queue.Queue", debug: bool):
+    """IRC anónimo de Twitch (solo lectura). Pasa los códigos que escriben mods o el streamer."""
+    while True:
+        try:
+            sock = socket.create_connection(("irc.chat.twitch.tv", 6667), timeout=360)
+            sock.sendall(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
+            sock.sendall(b"NICK justinfan%d\r\n" % (int(time.time() * 1000) % 89999 + 10000))
+            sock.sendall(f"JOIN #{channel}\r\n".encode())
+            buf = b""
+            while True:
+                data = sock.recv(8192)
+                if not data:
+                    raise ConnectionError("el servidor cerró la conexión")
+                buf += data
+                *lines, buf = buf.split(b"\r\n")
+                for raw in lines:
+                    line = raw.decode("utf-8", errors="ignore")
+                    if line.startswith("PING"):
+                        sock.sendall(b"PONG :tmi.twitch.tv\r\n")
+                    elif " JOIN #" in line or "ROOMSTATE" in line:
+                        if "ROOMSTATE" in line:
+                            log(f"Chat conectado (#{channel}). Solo se toman códigos de mods y del streamer.")
+                    elif (p := parse_privmsg(line)):
+                        tags, user, msg = p
+                        codes = chat_codes(msg)
+                        if not codes:
+                            continue
+                        if is_mod(tags):
+                            for c in codes:
+                                out.put((c, user))
+                        elif debug:
+                            log(f"[chat] ignorado (no es mod) {user}: {msg}")
+        except Exception as e:
+            log(f"Chat desconectado ({e}). Reconectando en 2s...")
+            time.sleep(2)
+
+
 # =============================================================== OCR
 class Reader:
     """RapidOCR (red neuronal, ONNX). Detecta cada línea de texto y la lee."""
@@ -354,58 +416,90 @@ def alert(code: str, kind: str):
 # =============================================================== main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--twitch", metavar="CANAL", help="leer el stream directo de Twitch")
+    ap.add_argument("--twitch", metavar="CANAL", help="canal de Twitch")
+    ap.add_argument("--chat", action="store_true", help="SOLO chat: códigos que escriban mods/streamer (no mira el video)")
     ap.add_argument("--quality", default="best", help="calidad del stream (default: best)")
     ap.add_argument("--pick", action="store_true", help="elegir la zona del código")
-    ap.add_argument("--auto-enter", action="store_true", help="Ctrl+V + Enter al detectar un código")
+    ap.add_argument("--auto-enter", action="store_true", help="Ctrl+A + Ctrl+V + Enter al detectar un código")
     ap.add_argument("--instant", action="store_true", help="no esperar la 2da lectura")
     ap.add_argument("--debug", action="store_true", help="mostrar cada lectura")
     args = ap.parse_args()
+    if args.chat and not args.twitch:
+        sys.exit("Con --chat tenés que poner el canal: --twitch rubius --chat")
 
+    clip = Clipboard()
+
+    def deliver(code: str, label: str):
+        clip.copy(code)
+        if args.auto_enter:
+            paste_and_enter()
+        alert(code, label)
+        print("\a", end="")
+        log(f">>> {label}: {code}  (copiado{' + Ctrl+V + Enter' if args.auto_enter else ''})")
+
+    if args.auto_enter:
+        log("AUTO-ENTER activado: dejá enfocado el campo donde se pega el código y no toques la compu.")
+
+    try:
+        if args.chat:
+            run_chat(args, clip, deliver)
+        else:
+            run_video(args, clip, deliver)
+    except KeyboardInterrupt:
+        print("\nChau.")
+
+
+def run_chat(args, clip, deliver):
+    channel = args.twitch.lower().removeprefix("https://").removeprefix("www.").removeprefix("twitch.tv/").strip("/")
+    q: queue.Queue = queue.Queue()
+    threading.Thread(target=chat_reader, args=(channel, q, args.debug), daemon=True).start()
+    log(f"Escuchando el chat de #{channel} (solo mods y streamer). Ctrl+C para salir.")
+    seen: set[str] = set()
+    while True:
+        try:
+            code, user = q.get(timeout=0.05)
+        except queue.Empty:
+            clip.pump()
+            continue
+        if code in seen:
+            if args.debug:
+                log(f"[chat] repetido de {user}: {code}")
+            continue
+        seen.add(code)
+        deliver(code, f"CHAT ({user})")
+
+
+def run_video(args, clip, deliver):
     source = TwitchSource(args.twitch, args.quality, args.pick) if args.twitch else ScreenSource(args.pick)
     log("Cargando OCR...")
     reader = Reader(args.debug)
     tracker = Tracker(need=1 if args.instant else 2)
-    clip = Clipboard()
     log(f"Vigilando {source.describe()}. Ctrl+C para salir.")
-    if args.auto_enter:
-        log("AUTO-ENTER activado: dejá enfocado el campo donde se pega el código y no toques la compu.")
-
     prev_small, prev_found, skipped = None, [], 0
-    try:
-        while True:
-            img = source.latest()
-            if img is None or img.size == 0:
-                time.sleep(0.01)
-                clip.pump()
-                continue
-            # Si la zona no cambió desde la última lectura (y no había código), no releer
-            small = img[::8, ::8].astype(np.int16)
-            if (prev_small is not None and small.shape == prev_small.shape and not prev_found
-                    and skipped < 15 and np.abs(small - prev_small).mean() < 1.5):
-                skipped += 1
-                time.sleep(0.01)
-                continue
-            prev_small, skipped = small, 0
-            t0 = time.perf_counter()
-            found = reader.read(img)
-            prev_found = found
-            if args.debug:
-                log(f"[frame] {1000 * (time.perf_counter() - t0):.0f}ms  {found}")
-            for code, anchored in found:
-                hit = tracker.add(code, anchored)
-                if not hit:
-                    continue
-                code, kind = hit
-                clip.copy(code)
-                if args.auto_enter:
-                    paste_and_enter()
-                alert(code, kind)
-                print("\a", end="")
-                log(f">>> {kind.upper()}: {code}  (copiado{' + Ctrl+V + Enter' if args.auto_enter else ''})")
+    while True:
+        img = source.latest()
+        if img is None or img.size == 0:
+            time.sleep(0.01)
             clip.pump()
-    except KeyboardInterrupt:
-        print("\nChau.")
+            continue
+        # Si la zona no cambió desde la última lectura (y no había código), no releer
+        small = img[::8, ::8].astype(np.int16)
+        if (prev_small is not None and small.shape == prev_small.shape and not prev_found
+                and skipped < 15 and np.abs(small - prev_small).mean() < 1.5):
+            skipped += 1
+            time.sleep(0.01)
+            continue
+        prev_small, skipped = small, 0
+        t0 = time.perf_counter()
+        found = reader.read(img)
+        prev_found = found
+        if args.debug:
+            log(f"[frame] {1000 * (time.perf_counter() - t0):.0f}ms  {found}")
+        for code, anchored in found:
+            hit = tracker.add(code, anchored)
+            if hit:
+                deliver(hit[0], f"VIDEO {hit[1].upper()}")
+        clip.pump()
 
 
 if __name__ == "__main__":
