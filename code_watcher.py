@@ -38,6 +38,7 @@ CODE = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{4})\s*-\s*([A-Z0-9]{4})\s*-\s*([A-Z0-
 # "CODIGO:" / "CÓDIGO" / "CODE" pegado o no al código
 ANCHOR = re.compile(r"C[O0Ó]D[I1]G[O0]|C[O0]DE")
 MIN_SCORE = 0.8
+INSTANT_SCORE = 0.9   # con "CODIGO" al lado y esta confianza, se acepta en la 1ra lectura
 
 
 def log(msg: str):
@@ -254,7 +255,7 @@ class Reader:
             if score < MIN_SCORE:
                 continue
             t = text.upper().replace("—", "-").replace("–", "-")
-            anchored = bool(ANCHOR.search(t))
+            anchored = bool(ANCHOR.search(t)) and score >= INSTANT_SCORE
             if anchored:  # "CODIGO:3G2C-..." o "CODIGO3G2C-...": sacar la etiqueta
                 t = ANCHOR.sub(" ", t).replace(":", " ")
             for m in CODE.findall(t):
@@ -370,6 +371,7 @@ def main():
     if args.auto_enter:
         log("AUTO-ENTER activado: dejá enfocado el campo donde se pega el código y no toques la compu.")
 
+    prev_small, prev_found, skipped = None, [], 0
     try:
         while True:
             img = source.latest()
@@ -377,8 +379,17 @@ def main():
                 time.sleep(0.01)
                 clip.pump()
                 continue
+            # Si la zona no cambió desde la última lectura (y no había código), no releer
+            small = img[::8, ::8].astype(np.int16)
+            if (prev_small is not None and small.shape == prev_small.shape and not prev_found
+                    and skipped < 15 and np.abs(small - prev_small).mean() < 1.5):
+                skipped += 1
+                time.sleep(0.01)
+                continue
+            prev_small, skipped = small, 0
             t0 = time.perf_counter()
             found = reader.read(img)
+            prev_found = found
             if args.debug:
                 log(f"[frame] {1000 * (time.perf_counter() - t0):.0f}ms  {found}")
             for code, anchored in found:
