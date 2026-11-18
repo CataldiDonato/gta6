@@ -47,13 +47,28 @@ En Windows usá `.venv\Scripts\python`, en Linux `.venv/bin/python`.
 
 Cortar con **Ctrl+C**.
 
+**Marcá la zona bien ajustada al código** (un poco de margen, sin mucho fondo): es lo que
+más mejora la lectura.
+
+Busca códigos con formato `LLLL-LLLL-LLLL` (solo letras). Para no avisar lecturas erróneas,
+un código se confirma cuando se lee 2 veces; las lecturas parecidas (1-3 letras distintas)
+se toman como el mismo código y no vuelven a avisar. Si más tarde una versión distinta
+junta claramente más lecturas, avisa una **corrección**.
+
 | Opción | Para qué |
 |---|---|
+| `--auto-enter` | al confirmar un código hace **Ctrl+V + Enter** solo. Dejá enfocado el campo de canje y no toques la compu. En Linux necesita `xdotool` |
 | `--pick` | volver a elegir la zona del código |
-| `--debug` | ver lo que lee el OCR (para chequear que lea bien la zona) |
+| `--debug` | ver lo que lee el OCR y cuánto tarda cada lectura |
+| `--instant` | no esperar la 2da lectura: más rápido pero más errores |
+| `--fast` | menos variantes de OCR: más rápido en PCs lentas, lee peor |
+| `--digits` | si el código también puede tener números |
 | `--quality 720p60` | si la compu va lenta (menos CPU, peor lectura) |
 | `--chat-all` | tomar códigos del chat de cualquiera (por defecto solo streamer/mods/VIPs) |
 | `--no-chat` | no leer el chat |
-| `--pattern REGEX` | si el código tiene otro formato que `ABCD-1234-EFGH` |
 
-Tips: el OCR a veces confunde **O/0** e **I/1** — si el canje falla, probá cambiándolas.
+## Actualizar
+
+```bash
+git pull
+```
