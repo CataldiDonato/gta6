@@ -18,6 +18,7 @@ Opciones:
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -237,7 +238,10 @@ class Reader:
             "Global.log_level": "error",
             "Det.limit_type": "max",          # no agrandar recortes chicos (era lo que lo hacía lento)
             "Det.limit_side_len": 960,
-            "Rec.lang_type": "en",            # modelo de letras latinas (no inventa caracteres chinos)
+            "Rec.lang_type": "en",
+            # Usar todos los núcleos no lo hace más rápido y le roba CPU a la decodificación del video
+            "EngineConfig.onnxruntime.intra_op_num_threads": max(1, min(4, (os.cpu_count() or 4) // 2)),
+            "EngineConfig.onnxruntime.inter_op_num_threads": 1,            # modelo de letras latinas (no inventa caracteres chinos)
         })
 
     def read(self, img: np.ndarray) -> list[tuple[str, bool]]:
