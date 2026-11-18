@@ -1,71 +1,46 @@
 #!/usr/bin/env python3
 """
-code-watcher: detecta códigos (formato LLLL-LLLL-LLLL, solo letras) que aparecen en un
-stream de Twitch, los copia al portapapeles y avisa. Con --auto-enter además hace
-Ctrl+V + Enter en la ventana que tengas enfocada.
+code-watcher: detecta códigos XXXX-XXXX-XXXX (letras y números) que aparecen en un stream de
+Twitch, los copia al portapapeles y avisa. Con --auto-enter además hace Ctrl+V + Enter en la
+ventana enfocada.
 
 Uso:
-  python code_watcher.py --twitch rubius --pick   # elegís la zona del código sobre un cuadro del stream
-  python code_watcher.py --twitch rubius          # vigila video + chat (streamer/mods/VIPs)
+  python code_watcher.py --twitch rubius --pick         # elegís la zona del código sobre un cuadro del stream
+  python code_watcher.py --twitch rubius                # vigila esa zona
   python code_watcher.py --twitch rubius --auto-enter   # además pega y da Enter solo
-  python code_watcher.py --pick / sin --twitch    # modo captura de pantalla (fallback)
+  python code_watcher.py --pick / sin --twitch          # modo captura de pantalla (fallback)
 
-Opciones útiles:
-  --auto-enter      pega (Ctrl+V) y da Enter cuando confirma un código. Dejá el campo de
-                    canje enfocado y no toques la compu.
-  --instant         no esperar a confirmar (2 lecturas iguales): más rápido, más errores
-  --digits          si el código también puede tener números
-  --fast            menos variantes de OCR: más rápido, lee peor sobre fondos complicados
-  --no-chat         no leer el chat
-  --chat-all        aceptar códigos del chat de cualquiera (por defecto solo mods/streamer)
-  --quality 720p60  menos CPU (peor lectura)
-  --debug           muestra cada lectura
+Opciones:
+  --auto-enter      Ctrl+V + Enter al detectar un código. Dejá enfocado el campo de canje.
+  --instant         no esperar la 2da lectura cuando el código no tiene "CODIGO:" al lado
+  --quality 720p60  menos CPU
+  --debug           muestra cada lectura y cuánto tarda
 """
 import argparse
 import json
-import os
-import queue
 import re
-import socket
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytesseract
-from PIL import Image, ImageChops, ImageOps
+import numpy as np
+from PIL import Image
 
 HERE = Path(__file__).parent
 SCREEN_CONFIG = HERE / "region.json"
 TWITCH_CONFIG = HERE / "twitch_region.json"
 
-# En Windows el instalador de Tesseract no lo agrega al PATH
-_WIN_TESSERACT = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-if sys.platform == "win32" and _WIN_TESSERACT.exists():
-    pytesseract.pytesseract.tesseract_cmd = str(_WIN_TESSERACT)
-if os.environ.get("TESSERACT_CMD"):
-    pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+CODE = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{4})\s*-\s*([A-Z0-9]{4})\s*-\s*([A-Z0-9]{4})(?![A-Z0-9])")
+# "CODIGO:" / "CÓDIGO" / "CODE" pegado o no al código
+ANCHOR = re.compile(r"C[O0Ó]D[I1]G[O0]|C[O0]DE")
+MIN_SCORE = 0.8
 
 
 def log(msg: str):
     print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
-
-
-# =============================================================== formato del código
-class CodeFormat:
-    """LLLL-LLLL-LLLL. Tolera que el OCR se coma o separe los guiones."""
-
-    def __init__(self, digits: bool):
-        chars = "A-Z0-9" if digits else "A-Z"
-        self.whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" + ("0123456789" if digits else "") + "-"
-        self.regex = re.compile(rf"(?<![{chars}])([{chars}]{{4}})[-\s]?([{chars}]{{4}})[-\s]?([{chars}]{{4}})(?![{chars}])")
-
-    def find(self, text: str) -> set[str]:
-        text = re.sub(r"[ \t]*-[ \t]*", "-", text.upper())
-        return {"-".join(m) for m in self.regex.findall(text)}
 
 
 def distance(a: str, b: str) -> int:
@@ -99,7 +74,7 @@ def drag_rectangle(background: Image.Image | None = None) -> tuple[int, int, int
         canvas._photo = photo
         cx = shown.width // 2
     canvas.create_text(cx, 30, fill="yellow", font=("Sans", 16, "bold"),
-                       text="Marcá la zona del código, bien ajustada · Esc cancela")
+                       text="Marcá la zona donde sale el código · Esc cancela")
     state: dict = {}
 
     def pos(e):
@@ -145,9 +120,9 @@ class ScreenSource:
     def describe(self):
         return f"pantalla {self.region}"
 
-    def latest(self) -> Image.Image | None:
+    def latest(self) -> np.ndarray | None:
         shot = self.sct.grab(self.region)
-        return Image.frombytes("RGB", shot.size, shot.rgb)
+        return np.array(Image.frombytes("RGB", shot.size, shot.rgb))
 
 
 class _Readable:
@@ -239,146 +214,79 @@ class TwitchSource:
                 log(f"Error con el stream ({e}). Reintento en 3s...")
             time.sleep(3)
 
-    def latest(self) -> Image.Image | None:
+    def latest(self) -> np.ndarray | None:
         with self._lock:
             if self._frame is None or self._frame_id == self._consumed_id:
                 return None
             frame, self._consumed_id = self._frame, self._frame_id
-        img = frame.to_image()
+        img = frame.to_ndarray(format="rgb24")
+        h, w = img.shape[:2]
         c = self.crop
-        return img.crop((int(c["x0"] * img.width), int(c["y0"] * img.height),
-                         int(c["x1"] * img.width), int(c["y1"] * img.height)))
-
-
-# =============================================================== chat de Twitch
-def chat_reader(channel: str, fmt: CodeFormat, out: queue.Queue, everyone: bool):
-    """IRC anónimo de Twitch. Por defecto solo toma códigos del streamer, mods o VIPs."""
-    trusted = ("broadcaster/", "moderator/", "vip/")
-    while True:
-        try:
-            sock = socket.create_connection(("irc.chat.twitch.tv", 6667), timeout=300)
-            sock.sendall(b"CAP REQ :twitch.tv/tags\r\nNICK justinfan%d\r\n" % (int(time.time()) % 100000))
-            sock.sendall(f"JOIN #{channel}\r\n".encode())
-            log(f"Chat conectado (#{channel}, {'todos' if everyone else 'solo streamer/mods/VIPs'}).")
-            buf = b""
-            while True:
-                data = sock.recv(4096)
-                if not data:
-                    raise ConnectionError("chat cerrado")
-                buf += data
-                *lines, buf = buf.split(b"\r\n")
-                for raw in lines:
-                    line = raw.decode(errors="ignore")
-                    if line.startswith("PING"):
-                        sock.sendall(b"PONG :tmi.twitch.tv\r\n")
-                        continue
-                    if " PRIVMSG " not in line:
-                        continue
-                    tags_str = line[1:].split(" ", 1)[0] if line.startswith("@") else ""
-                    tags = dict(t.split("=", 1) for t in tags_str.split(";") if "=" in t)
-                    if not everyone and not any(b in tags.get("badges", "") for b in trusted):
-                        continue
-                    msg = line.split(" PRIVMSG ", 1)[1].split(" :", 1)[-1]
-                    for code in fmt.find(msg):
-                        out.put(code)
-        except Exception as e:
-            log(f"Chat desconectado ({e}). Reintento en 3s...")
-            time.sleep(3)
+        return img[int(c["y0"] * h):int(c["y1"] * h), int(c["x0"] * w):int(c["x1"] * w)]
 
 
 # =============================================================== OCR
-def _otsu(g: Image.Image) -> int:
-    h = g.histogram()
-    total, sum_all = sum(h), sum(i * h[i] for i in range(256))
-    wb = sb = 0
-    best_v, best_t = 0, 128
-    for t in range(256):
-        wb += h[t]
-        if wb == 0 or wb == total:
-            continue
-        sb += t * h[t]
-        mb, mf = sb / wb, (sum_all - sb) / (total - wb)
-        v = wb * (total - wb) * (mb - mf) ** 2
-        if v > best_v:
-            best_v, best_t = v, t
-    return best_t
-
-
-def variants(img: Image.Image, fast: bool) -> list[Image.Image]:
-    """
-    Versiones de la imagen para Tesseract (texto negro sobre blanco).
-    - Por color: se reduce a 6 colores y se aísla cada uno. El texto de un overlay suele ser
-      un color parejo, así que una de las máscaras queda con el texto limpio sin el fondo
-      del juego. Es lo que más mejora la lectura sobre gameplay.
-    - Umbral automático (Otsu) en gris, en las dos polaridades.
-    """
-    k = 4 if fast else 6
-    q = img.quantize(colors=k, method=Image.Quantize.MEDIANCUT)
-    raw = Image.frombytes("L", q.size, q.tobytes())
-    out = [raw.point([0 if i == idx else 255 for i in range(256)]) for idx in range(k)]
-    if not fast:
-        g = ImageOps.grayscale(img)
-        th = _otsu(g)
-        bw = g.point(lambda p: 255 if p > th else 0)
-        out += [bw, ImageOps.invert(bw)]
-    return out
-
-
 class Reader:
-    def __init__(self, fmt: CodeFormat, fast: bool, debug: bool):
-        self.fmt, self.fast, self.debug = fmt, fast, debug
-        self.config = f"--psm 6 -c tessedit_char_whitelist={fmt.whitelist}"
-        self.pool = ThreadPoolExecutor(max(2, min(8, os.cpu_count() or 4)))
+    """RapidOCR (red neuronal, ONNX). Detecta cada línea de texto y la lee."""
 
-    def _ocr(self, v: Image.Image) -> set[str]:
-        text = pytesseract.image_to_string(v, config=self.config)
-        if self.debug and text.strip():
-            log(f"[ocr] {text.strip()!r}")
-        return self.fmt.find(text)
+    def __init__(self, debug: bool):
+        from rapidocr import RapidOCR
+        self.debug = debug
+        self.engine = RapidOCR(params={
+            "Global.use_cls": False,          # el texto no viene rotado
+            "Global.log_level": "error",
+            "Det.limit_type": "max",          # no agrandar recortes chicos (era lo que lo hacía lento)
+            "Det.limit_side_len": 960,
+            "Rec.lang_type": "en",            # modelo de letras latinas (no inventa caracteres chinos)
+        })
 
-    def read(self, img: Image.Image) -> dict[str, int]:
-        """Devuelve {código: cantidad de variantes que lo leyeron}."""
-        votes: dict[str, int] = {}
-        for found in self.pool.map(self._ocr, variants(img, self.fast)):
-            for c in found:
-                votes[c] = votes.get(c, 0) + 1
-        return votes
+    def read(self, img: np.ndarray) -> list[tuple[str, bool]]:
+        """Devuelve [(código, tiene "CODIGO" al lado)]."""
+        r = self.engine(img)
+        out = []
+        for text, score in zip(r.txts or (), r.scores or ()):
+            if self.debug:
+                log(f"[ocr] {text!r} ({score:.2f})")
+            if score < MIN_SCORE:
+                continue
+            t = text.upper().replace("—", "-").replace("–", "-")
+            anchored = bool(ANCHOR.search(t))
+            if anchored:  # "CODIGO:3G2C-..." o "CODIGO3G2C-...": sacar la etiqueta
+                t = ANCHOR.sub(" ", t).replace(":", " ")
+            for m in CODE.findall(t):
+                out.append(("-".join(m), anchored))
+        return out
 
 
 # =============================================================== confirmación / anti-duplicados
 class Tracker:
     """
-    Junta las lecturas parecidas (≤3 letras distintas = el mismo código mal leído) en un grupo.
-    Un código se confirma con 2 votos (de variantes o cuadros distintos, en los últimos 4s).
-    Si después otra lectura del mismo grupo junta claramente más votos, se toma como corrección.
+    Lecturas parecidas (≤3 caracteres distintos) = el mismo código mal leído: se agrupan y se
+    avisa una sola vez. Se confirma al instante si al lado dice "CODIGO", si no con 2 lecturas.
+    Si después otra versión del mismo grupo junta claramente más lecturas, avisa una corrección.
     """
-    WINDOW = 4.0
 
     def __init__(self, need: int):
         self.need = need
-        self.groups: list[dict] = []   # {"votes": {code: [timestamps]}, "sent": code|None, "fixes": int}
+        self.groups: list[dict] = []
 
     def _group(self, code):
         for g in self.groups:
             if any(distance(code, c) <= 3 for c in g["votes"]):
                 return g
-        g = {"votes": {}, "sent": None, "fixes": 0}
+        g = {"votes": {}, "first": time.time(), "sent": None, "fixes": 0}
         self.groups.append(g)
         return g
 
-    def add(self, code: str, n: int = 1, trusted: bool = False) -> tuple[str, str] | None:
-        """Devuelve (código, 'nuevo'|'corrección') si hay que avisar."""
-        now = time.time()
+    def add(self, code: str, anchored: bool) -> tuple[str, str] | None:
         g = self._group(code)
-        g["votes"].setdefault(code, []).extend([now] * (99 if trusted else n))
-        score = {c: sum(1 for t in ts if now - t <= self.WINDOW) if g["sent"] is None else len(ts)
-                 for c, ts in g["votes"].items()}
-        best = max(score, key=score.get)
+        g["votes"][code] = g["votes"].get(code, 0) + 1
+        best = max(g["votes"], key=g["votes"].get)
         if g["sent"] is None:
-            if score[best] >= self.need:
-                g["sent"] = best
-                return best, "nuevo"
-        elif best != g["sent"] and score[best] >= score[g["sent"]] + 2 and g["fixes"] < 2:
+            if anchored or g["votes"][best] >= self.need:
+                g["sent"] = best if not anchored else code
+                return g["sent"], "nuevo"
+        elif best != g["sent"] and g["votes"][best] >= g["votes"].get(g["sent"], 0) + 2 and g["fixes"] < 2:
             g["sent"] = best
             g["fixes"] += 1
             return best, "corrección"
@@ -440,56 +348,42 @@ def main():
     ap.add_argument("--twitch", metavar="CANAL", help="leer el stream directo de Twitch")
     ap.add_argument("--quality", default="best", help="calidad del stream (default: best)")
     ap.add_argument("--pick", action="store_true", help="elegir la zona del código")
-    ap.add_argument("--auto-enter", action="store_true", help="Ctrl+V + Enter al confirmar un código")
-    ap.add_argument("--instant", action="store_true", help="no esperar confirmación (más errores)")
-    ap.add_argument("--digits", action="store_true", help="el código puede tener números")
-    ap.add_argument("--fast", action="store_true", help="menos variantes de OCR")
-    ap.add_argument("--no-chat", action="store_true", help="no leer el chat de Twitch")
-    ap.add_argument("--chat-all", action="store_true", help="aceptar códigos del chat de cualquiera")
+    ap.add_argument("--auto-enter", action="store_true", help="Ctrl+V + Enter al detectar un código")
+    ap.add_argument("--instant", action="store_true", help="no esperar la 2da lectura")
     ap.add_argument("--debug", action="store_true", help="mostrar cada lectura")
     args = ap.parse_args()
 
-    fmt = CodeFormat(args.digits)
     source = TwitchSource(args.twitch, args.quality, args.pick) if args.twitch else ScreenSource(args.pick)
-    reader = Reader(fmt, args.fast, args.debug)
+    log("Cargando OCR...")
+    reader = Reader(args.debug)
     tracker = Tracker(need=1 if args.instant else 2)
-
-    chat_q: queue.Queue = queue.Queue()
-    if args.twitch and not args.no_chat:
-        threading.Thread(target=chat_reader, args=(source.channel, fmt, chat_q, args.chat_all),
-                         daemon=True).start()
-
     clip = Clipboard()
     log(f"Vigilando {source.describe()}. Ctrl+C para salir.")
     if args.auto_enter:
         log("AUTO-ENTER activado: dejá enfocado el campo donde se pega el código y no toques la compu.")
 
-    def handle(hit, origin):
-        if not hit:
-            return
-        code, kind = hit
-        clip.copy(code)
-        if args.auto_enter:
-            paste_and_enter()
-        alert(code, kind)
-        print("\a", end="")
-        extra = " + Ctrl+V + Enter" if args.auto_enter else ""
-        log(f">>> [{origin}] {kind.upper()}: {code}  (copiado{extra})")
-
     try:
         while True:
             img = source.latest()
-            if img is None:
+            if img is None or img.size == 0:
                 time.sleep(0.01)
-            else:
-                t0 = time.perf_counter()
-                votes = reader.read(img)
-                if args.debug:
-                    log(f"[frame] {1000 * (time.perf_counter() - t0):.0f}ms  {votes}")
-                for code, n in sorted(votes.items(), key=lambda kv: -kv[1]):
-                    handle(tracker.add(code, n), "video")
-            while not chat_q.empty():
-                handle(tracker.add(chat_q.get(), trusted=True), "chat")
+                clip.pump()
+                continue
+            t0 = time.perf_counter()
+            found = reader.read(img)
+            if args.debug:
+                log(f"[frame] {1000 * (time.perf_counter() - t0):.0f}ms  {found}")
+            for code, anchored in found:
+                hit = tracker.add(code, anchored)
+                if not hit:
+                    continue
+                code, kind = hit
+                clip.copy(code)
+                if args.auto_enter:
+                    paste_and_enter()
+                alert(code, kind)
+                print("\a", end="")
+                log(f">>> {kind.upper()}: {code}  (copiado{' + Ctrl+V + Enter' if args.auto_enter else ''})")
             clip.pump()
     except KeyboardInterrupt:
         print("\nChau.")

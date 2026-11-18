@@ -1,5 +1,7 @@
 mss
-pytesseract
 pillow
+numpy
 streamlink
 av
+rapidocr
+onnxruntime
